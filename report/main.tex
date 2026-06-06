@@ -384,7 +384,10 @@ better characterized quantitatively (compactness) than visually.
 precisely \emph{because} it occasionally removes dominant high-opacity Gaussians,
 forcing the rest to compensate; H1 protects exactly those Gaussians and thereby blunts
 the regularizer. The bounded compensation needed to keep variance sane (Sec.~\ref{sec:method})
-cannot recover this loss. The hypothesis is cleanly falsified.
+cannot recover this loss. Tellingly, H1 also \emph{inflates} the model to $100$k
+Gaussians (vs.\ $76.6$k original and $68.4$k for H2)---the opposite of H2's
+compactness---further evidence that biasing drops toward low-opacity Gaussians
+backfires. The hypothesis is cleanly falsified.
 
 \emph{H2: yes, with a nuance.} Drop-aware densification gives $+0.22$\,dB (6/8) and,
 more robustly, a deterministic $\sim$10\% reduction in Gaussian count on every scene at
