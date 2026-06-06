@@ -16,7 +16,7 @@ from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 
 def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, \
-           override_color = None, is_train=False, iteration=None):
+           override_color = None, is_train=False, iteration=None, drop_mode="original"):
     """
     Render the scene. 
     
@@ -83,15 +83,38 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     else:
         colors_precomp = override_color
 
-    # DropGaussian
-    if is_train:
-        # Create initial compensation factor (1 for each Gaussian)
-        compensation = torch.ones(opacity.shape[0], dtype=torch.float32, device="cuda")
+    # DropGaussian (+ improvements). `compensation` is the per-Gaussian opacity
+    # scaling actually applied this iteration; returned so densification (H2) can
+    # undo the dropout-induced gradient scaling.
+    compensation = None
+    if is_train and drop_mode != "none":
+        N = opacity.shape[0]
+        # Same global schedule as the original DropGaussian (linearly 0 -> 0.2).
+        drop_rate = 0.2 * (iteration / 10000)
 
-        # Apply DropGaussian with compensation
-        drop_rate = 0.2 * (iteration/10000)
-        d = torch.nn.Dropout(p=drop_rate)
-        compensation = d(compensation)
+        if drop_mode == "original":
+            # Vanilla DropGaussian: uniform inverted dropout on all Gaussians.
+            compensation = torch.ones(N, dtype=torch.float32, device="cuda")
+            d = torch.nn.Dropout(p=drop_rate)
+            compensation = d(compensation)
+
+        elif drop_mode == "opacity_aware":
+            # H1: opacity-aware adaptive drop with unbiased compensation.
+            # Low-opacity (redundant / floater) Gaussians get a higher drop
+            # probability while high-opacity structural Gaussians are protected;
+            # the survivor scaling 1/keep keeps the rendering unbiased (low variance).
+            o = opacity.squeeze(-1).detach().clamp(1e-4, 1.0)   # [N] in (0,1]
+            w = (1.0 - o)                                       # low opacity -> larger weight
+            w = w / (w.mean() + 1e-8)                           # normalize so mean(drop prob) == drop_rate
+            # Per-Gaussian drop probability, capped at 2x the global rate so the
+            # survivor compensation 1/keep stays bounded (<= ~1.67x), keeping the
+            # rendering variance low — variance-aware importance dropout.
+            p_i = (drop_rate * w).clamp(max=min(2.0 * drop_rate, 0.9))
+            keep = 1.0 - p_i
+            mask = torch.bernoulli(keep)                        # 1 = keep
+            compensation = mask / keep                          # unbiased: E[compensation] = 1
+        else:
+            raise ValueError(f"Unknown drop_mode: {drop_mode}")
 
         # Apply to opacity
         opacity = opacity * compensation[:, None]
@@ -114,7 +137,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         "render": rendered_image,
         "viewspace_points": screenspace_points,
         "visibility_filter" : (radii > 0).nonzero(),
-        "radii": radii
+        "radii": radii,
+        "compensation": compensation
         }
     
     return out

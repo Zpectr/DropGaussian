@@ -1,0 +1,27 @@
+# Build artifacts
+submodules/**/build/
+submodules/**/*.egg-info/
+**/__pycache__/
+*.pyc
+
+# Local env setup (not part of source)
+wheels/
+.cache_tmp/
+
+# Datasets and experiment outputs (large / generated)
+dataset/
+output/
+*.ply
+
+# LaTeX build artifacts (keep main.tex and main.pdf)
+report/*.aux
+report/*.log
+report/*.out
+report/*.bbl
+report/*.blg
+
+# Data package (delivered separately, not in git)
+data_package.zip
+
+# OS
+.DS_Store

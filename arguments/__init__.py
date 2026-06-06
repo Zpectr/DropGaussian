@@ -89,6 +89,13 @@ class OptimizationParams(ParamGroup):
         self.densify_until_iter = 10000
         self.densify_grad_threshold = 0.0005
         self.random_background = False
+        # ---- DropGaussian improvements (this work) ----
+        # drop_mode: "original" = vanilla DropGaussian (uniform dropout);
+        #            "none"     = no dropout (3DGS sparse baseline);
+        #            "opacity_aware" = H1, opacity-aware adaptive drop w/ unbiased compensation
+        self.drop_mode = "original"
+        # H2: correct densification gradient statistics for the dropout scaling
+        self.drop_aware_densify = False
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

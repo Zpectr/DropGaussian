@@ -403,7 +403,14 @@ class GaussianModel:
 
         torch.cuda.empty_cache()
 
-    def add_densification_stats(self, viewspace_point_tensor, update_filter):
-        self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
+    def add_densification_stats(self, viewspace_point_tensor, update_filter, compensation=None):
+        grad = viewspace_point_tensor.grad[update_filter,:2]
+        if compensation is not None:
+            # H2: the screen-space gradient of a surviving Gaussian is scaled by its
+            # dropout compensation (opacity *= comp). Divide it out so densification
+            # decisions reflect the un-dropped gradient magnitude.
+            comp = compensation[update_filter].clamp(min=1e-6).unsqueeze(-1)
+            grad = grad / comp
+        self.xyz_gradient_accum[update_filter] += torch.norm(grad, dim=-1, keepdim=True)
         self.denom[update_filter] += 1
 

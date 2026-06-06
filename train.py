@@ -78,8 +78,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             pipe.debug = True
 
         bg = torch.rand((3), device="cuda") if opt.random_background else background
-        render_pkg = render(viewpoint_cam, gaussians, pipe, bg, is_train=True, iteration=iteration)
+        render_pkg = render(viewpoint_cam, gaussians, pipe, bg, is_train=True, iteration=iteration, drop_mode=opt.drop_mode)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+        compensation = render_pkg["compensation"]
 
         Ll1 = l1_loss(image, gt_image)
         ssim_value = ssim(image, gt_image)
@@ -109,7 +110,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # Densification
             if iteration < opt.densify_until_iter:
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
-                gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+                # H2: pass compensation so densification gradient stats can be
+                # de-biased w.r.t. the dropout opacity scaling (no-op if disabled).
+                densify_comp = compensation if (opt.drop_aware_densify and compensation is not None) else None
+                gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter, densify_comp)
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = None

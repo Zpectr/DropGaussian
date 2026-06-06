@@ -1,0 +1,9 @@
+scene,config,num_gaussians,peak_mem_MB,fps_note
+fortress,original,58002,124.4,fps unstable (shared GPU)
+fortress,h2,52275,116.4,
+leaves,original,158319,168.1,
+leaves,h2,135223,152.6,
+room,original,41133,80.5,
+room,h2,37380,77.8,
+mean_8scene,original,76642,,training ~1:20/scene
+mean_8scene,h2,68429,,training ~1:18/scene (H2 overhead negligible)
