@@ -1,20 +1,21 @@
-"""Build qualitative comparison figures: GT vs configs, for several test views.
+"""Build qualitative comparison figures (matplotlib, large clear labels).
 
 Usage (inside container):
-  python tools/make_comparison.py --scene fern \
-      --configs none original h1h2 --root output/ablation \
-      --out results/figs/fern_compare.png --views 0 2 4
+  python tools/make_comparison.py --scene fortress \
+      --configs none original h2 --root output/ablation8 \
+      --out results/figs/fortress_compare.png --views 0 1 2
 """
-import os
-import argparse
-import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import os, argparse
+from PIL import Image
 
 LABELS = {
     "none": "3DGS (no drop)",
     "original": "DropGaussian",
     "h1": "Ours H1",
-    "h2": "Ours H2",
+    "h2": "Ours (H2)",
     "h1h2": "Ours (H1+H2)",
     "gt": "Ground Truth",
 }
@@ -25,50 +26,36 @@ def load(path):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--scene", required=True)
-    ap.add_argument("--configs", nargs="+", default=["none", "original", "h1h2"])
-    ap.add_argument("--root", default="output/ablation")
+    ap.add_argument("--configs", nargs="+", default=["none", "original", "h2"])
+    ap.add_argument("--root", default="output/ablation8")
     ap.add_argument("--iteration", default="10000")
-    ap.add_argument("--views", nargs="+", type=int, default=[0, 2, 4])
+    ap.add_argument("--views", nargs="+", type=int, default=[0, 1, 2])
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
-    # columns: GT + each config ; rows: views
     cols = ["gt"] + args.configs
-    pad, lab_h = 4, 22
-    rows_imgs = []
-    cell_w = cell_h = None
-    for v in args.views:
-        row = []
-        for c in cols:
-            base = os.path.join(args.root, args.configs[0] if c == "gt" else c,
+    nrows, ncols = len(args.views), len(cols)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 3.0, nrows * 2.1))
+    if nrows == 1:
+        axes = axes.reshape(1, -1)
+
+    for r, v in enumerate(args.views):
+        for c, cfg in enumerate(cols):
+            base = os.path.join(args.root, args.configs[0] if cfg == "gt" else cfg,
                                 args.scene, "test", f"ours_{args.iteration}")
-            sub = "gt" if c == "gt" else "renders"
-            p = os.path.join(base, sub, f"{v:05d}.png")
-            im = load(p)
-            if cell_w is None:
-                cell_w, cell_h = im.size
-            row.append(im.resize((cell_w, cell_h)))
-        rows_imgs.append(row)
-
-    W = len(cols) * cell_w + (len(cols) + 1) * pad
-    H = len(args.views) * (cell_h + lab_h) + (len(args.views) + 1) * pad
-    canvas = Image.new("RGB", (W, H), (255, 255, 255))
-    draw = ImageDraw.Draw(canvas)
-    try:
-        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 14)
-    except Exception:
-        font = ImageFont.load_default()
-
-    for r, row in enumerate(rows_imgs):
-        y = pad + r * (cell_h + lab_h + pad)
-        for c, im in enumerate(row):
-            x = pad + c * (cell_w + pad)
+            sub = "gt" if cfg == "gt" else "renders"
+            im = load(os.path.join(base, sub, f"{v:05d}.png"))
+            ax = axes[r, c]
+            ax.imshow(im); ax.set_xticks([]); ax.set_yticks([])
             if r == 0:
-                draw.text((x + 2, y), LABELS.get(cols[c], cols[c]), fill=(0, 0, 0), font=font)
-            canvas.paste(im, (x, y + lab_h))
+                ax.set_title(LABELS.get(cfg, cfg), fontsize=15, fontweight="bold", pad=6)
+            if c == 0:
+                ax.set_ylabel(f"view {v}", fontsize=13)
 
+    fig.suptitle(f"LLFF 3-view: {args.scene}", fontsize=16, fontweight="bold")
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
-    canvas.save(args.out)
+    fig.savefig(args.out, dpi=140, bbox_inches="tight")
     print("saved", args.out)
 
 if __name__ == "__main__":
