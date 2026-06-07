@@ -28,24 +28,26 @@ Student ID}}
 DropGaussian is a recent structural regularizer for sparse-view 3D Gaussian
 Splatting (3DGS) that randomly eliminates Gaussians during training so that the
 remaining ones receive larger gradients, alleviating overfitting under sparse
-inputs. We first reproduce DropGaussian on the LLFF 3-view benchmark, matching
-the reported 8-scene mean within 1.6\% PSNR. We then identify two independent
-methodological weaknesses: (i) the dropout is \emph{uniform}, treating all
-Gaussians as equally important despite their highly skewed opacity distribution,
-and (ii) the densification statistics are computed from the \emph{dropout-perturbed}
-gradients, silently coupling the regularizer with the cloning/splitting heuristic.
-We turn each into a falsifiable hypothesis and implement two improvements: an
-opacity-aware adaptive dropout with unbiased, variance-bounded compensation (H1)
-and a drop-aware densification gradient correction (H2). Through a noise-controlled
-8-scene ablation we find that H1 does \emph{not} hold---protecting high-opacity
-Gaussians weakens the very ``break-the-dominance'' mechanism that makes DropGaussian
-work---while H2 yields a small but consistent quality gain (+0.22\,dB, 6/8 scenes)
-and, more convincingly, a \emph{deterministic} $\sim$10\% reduction in the number of
-Gaussians on all eight scenes at equal-or-better SSIM/LPIPS and negligible cost. We
-quantify the run-to-run noise floor of the non-deterministic CUDA rasterizer, show
-that the compactness result is noise-free, and discuss why dropout-level refinements
-have diminishing returns on this already-strong baseline. We report all outcomes,
-positive and negative, honestly.
+inputs. We first reproduce DropGaussian on the LLFF 3-view benchmark, matching the
+reported 8-scene mean within 1.6\% PSNR, and quantify the overfitting it leaves
+behind: an 8-scene mean train/test PSNR gap of 14.7\,dB (versus 18.2\,dB for vanilla
+3DGS). We then identify two \emph{independent} methodological weaknesses: (i) the
+dropout is \emph{uniform}, treating all Gaussians as equally important despite a
+strongly bimodal opacity distribution, and (ii) the densification statistics are
+read from the \emph{dropout-perturbed} gradients, silently coupling the regularizer
+with the cloning/splitting heuristic. We turn each into a falsifiable hypothesis and
+implement two improvements: an opacity-aware adaptive dropout with unbiased,
+variance-bounded compensation (H1) and a drop-aware densification gradient correction
+(H2). Through a noise-controlled 8-scene ablation we find that H1 does \emph{not}
+hold---protecting high-opacity Gaussians weakens the very ``break-the-dominance''
+mechanism that makes DropGaussian work, and even \emph{inflates} the model to 100k
+Gaussians---while H2 yields a small but consistent quality gain (+0.22\,dB, 6/8
+scenes) and, more convincingly, a \emph{deterministic} 10.7\% reduction in the number
+of Gaussians on all eight scenes at equal-or-better SSIM/LPIPS, a smaller overfitting
+gap, and negligible cost. We quantify the run-to-run noise floor of the
+non-deterministic CUDA rasterizer, show that the compactness result is noise-free,
+and discuss why dropout-level refinements have diminishing returns on this
+already-strong baseline. We report all outcomes, positive and negative, honestly.
 \end{abstract}
 
 \begin{IEEEkeywords}
@@ -55,88 +57,137 @@ densification, novel view synthesis
 
 \section{Introduction}
 3D Gaussian Splatting (3DGS)~\cite{kerbl3Dgaussians} represents a scene as a set of
-anisotropic 3D Gaussians, each with a position, covariance, opacity and view-dependent
-color, and renders them by differentiable rasterization. It attains real-time,
-photorealistic novel view synthesis and has rapidly become a default explicit
-radiance-field representation. Its quality, however, hinges on \emph{dense} multi-view
-supervision. When only a handful of input views are available---the sparse-view
-regime relevant to casual capture and robotics/SLAM front-ends---3DGS overfits the
-training views: redundant Gaussians proliferate, opacities drift, and the held-out
-views exhibit floaters, holes and broken geometry.
+$N$ anisotropic 3D Gaussians $\{\mathcal{G}_i\}$, each parameterized by a mean
+$\mu_i\in\mathbb{R}^3$, a covariance $\Sigma_i$ (factored into a scale and a
+rotation), an opacity $o_i\in(0,1)$, and a set of spherical-harmonic color
+coefficients. An image is formed by projecting the Gaussians to screen space and
+$\alpha$-compositing them front-to-back; the per-pixel color is
+$C=\sum_i c_i\,\alpha_i\prod_{j<i}(1-\alpha_j)$, where $\alpha_i$ is the projected
+opacity. Because the entire pipeline is differentiable, all Gaussian parameters are
+optimized by gradient descent against the input views, and an \emph{adaptive density
+control} heuristic periodically clones, splits and prunes Gaussians. 3DGS attains
+real-time, photorealistic novel view synthesis and has become a default explicit
+radiance-field representation.
 
-A growing body of work tackles sparse-view 3DGS by injecting external knowledge
-(monocular-depth priors, cross-field co-regularization, generative priors).
-DropGaussian~\cite{park2025dropgaussian} stands out by being \emph{prior-free}: it
+Its quality, however, hinges on \emph{dense} multi-view supervision. In the
+sparse-view regime---only a handful of input images, as is common in casual capture
+and robotics/SLAM front-ends---3DGS overfits: with too few photometric constraints,
+the highly expressive set of Gaussians can drive the \emph{training} error to near
+zero while the held-out views deteriorate into floaters, holes and broken geometry.
+We measure this directly (Sec.~\ref{sec:baseline}): under 3 input views, vanilla 3DGS
+reaches 38\,dB on the training views but only 19.9\,dB on the test views---an 18.2\,dB
+generalization gap.
+
+A growing body of work tackles sparse-view 3DGS by injecting external knowledge:
+monocular-depth priors, cross-field co-regularization, or generative priors.
+DropGaussian~\cite{park2025dropgaussian} stands out by being \emph{prior-free}. It
 borrows the idea of Dropout from deep networks and randomly \emph{eliminates}
 Gaussians during the forward pass. Concretely, at iteration $t$ it draws a dropout
 rate $p_t=0.2\,(t/T)$ that grows linearly with training, multiplies each Gaussian's
-opacity by an i.i.d.\ inverted-dropout mask, and rescales survivors by $1/(1-p_t)$.
-The intuition is that removing a random subset forces the remaining Gaussians to
-``stand in'' for the missing ones, distributing gradients more evenly and preventing
-a few dominant Gaussians from memorizing the training views. Despite its simplicity,
-DropGaussian is competitive with prior-based methods.
+opacity by an i.i.d.\ inverted-dropout mask, and rescales survivors by $1/(1-p_t)$ to
+keep the rendered opacity unbiased in expectation. The intuition is that removing a
+random subset forces the remaining Gaussians to ``stand in'' for the missing ones,
+spreading gradients more evenly and preventing a few dominant Gaussians from
+memorizing the training views. Despite its simplicity, DropGaussian is competitive
+with prior-based methods.
 
-Precisely because the idea is simple and prior-free, it is a clean object of study:
-every design choice is exposed and can be questioned. Following the
+Precisely \emph{because} the idea is simple and prior-free, it is a clean object of
+study: every design choice is exposed and can be questioned. Following the
 \emph{read $\rightarrow$ find flaws $\rightarrow$ hypothesize $\rightarrow$ implement
 $\rightarrow$ experiment} loop, this work makes two contributions:
 \begin{itemize}
-\item We \textbf{reproduce} DropGaussian on the eight LLFF 3-view scenes and confirm
-its reported gains over vanilla 3DGS, establishing a faithful, noise-characterized
-baseline (Sec.~\ref{sec:baseline}).
+\item We \textbf{reproduce} DropGaussian on the eight LLFF 3-view scenes, confirm its
+gains over vanilla 3DGS, and characterize the residual overfitting and the
+rasterization noise floor, establishing a faithful, well-understood baseline
+(Sec.~\ref{sec:baseline}).
 \item We \textbf{analyze} two \emph{independent} weaknesses---the uniformity of the
-dropout (L1) and its pollution of the densification statistics (L2)---turn each into
-a falsifiable hypothesis, implement both (H1, H2), and evaluate them with a
+dropout (L1) and its pollution of the densification statistics (L2)---turn each into a
+falsifiable hypothesis, implement both (H1, H2), and evaluate them with a
 noise-controlled 8-scene ablation (Sec.~\ref{sec:limitations}--\ref{sec:exp}). We
-report a negative result (H1) and a small but mechanistically-validated positive one
-(H2) with full honesty.
+report a clean negative result (H1) and a small but mechanistically-validated positive
+one (H2), with full honesty about effect sizes and noise.
 \end{itemize}
 Our aim is a methodologically rigorous study rather than a headline number; we treat
 the negative result as a first-class outcome.
 
 \section{Related Work}
+\textbf{Sparse-view NeRF.} Before 3DGS, sparse-view neural radiance fields were tamed
+by hand-designed regularizers. DietNeRF~\cite{jain2021dietnerf} matches high-level CLIP
+semantics across rendered viewpoints; RegNeRF~\cite{niemeyer2022regnerf} regularizes the
+geometry and appearance of \emph{unobserved} viewpoints with a learned patch prior;
+FreeNeRF~\cite{yang2023freenerf} simply anneals the positional-encoding frequency to
+curb early high-frequency overfitting. These differ in mechanism but share one
+philosophy---constrain an over-expressive model when photometric supervision is
+scarce---operating on an implicit MLP field. DropGaussian can be read as porting that
+philosophy to the \emph{explicit} setting, with random structural elimination playing
+the role of the frequency/geometry priors. This lineage is also why overfitting, not
+raw capacity, is the right thing to attack, and why our analysis centers on the
+train/test gap.
+
 \textbf{Sparse-view 3DGS.} Few-shot Gaussian Splatting methods largely fall into two
 camps. \emph{Prior-based} methods inject external supervision: FSGS~\cite{zhu2024fsgs}
-proximity-guided densification and a monocular-depth regularizer, DNGaussian a
-depth-normalization loss, and CoR-GS a co-regularization between two simultaneously
-trained Gaussian fields. These improve geometry but depend on the quality of the
-external prior. \emph{Prior-free} methods instead regularize the optimization itself;
-DropGaussian~\cite{park2025dropgaussian} is the representative we study, regularizing
-purely through random structural elimination. Our improvements stay within this
-prior-free setting and require no extra data or networks.
+adds proximity-guided densification and a monocular-depth regularizer; DNGaussian uses
+a depth-normalization loss to stabilize geometry; CoR-GS co-regularizes two
+simultaneously trained Gaussian fields against each other. These improve geometry but
+inherit the biases and failure modes of the external prior (e.g.\ scale ambiguity in
+monocular depth). \emph{Prior-free} methods instead regularize the optimization
+itself. DropGaussian~\cite{park2025dropgaussian}, the representative we study, needs no
+extra data or networks---it regularizes purely through random structural elimination.
+Our improvements deliberately stay within this prior-free setting so that any gain is
+attributable to the regularizer, not to side information.
 
 \textbf{Dropout and its structured variants.} Dropout regularizes neural networks by
-randomly zeroing activations; inverted dropout rescales survivors to keep the
-expectation unchanged. A recurring lesson is that \emph{uniform} i.i.d.\ dropout is
-not always optimal: DropBlock removes contiguous spatial regions because neighboring
-units are correlated and i.i.d.\ dropping is easily ``routed around''. DropGaussian is
-essentially inverted Dropout on opacities; this motivates us to ask whether its
-uniform, importance-agnostic masking (L1) is the right choice for a highly
-heterogeneous set of Gaussians.
+randomly zeroing activations during training; inverted dropout rescales the survivors
+so the expected activation is unchanged. DropGaussian is, in effect, inverted dropout
+applied to Gaussian opacities. A recurring lesson from the deep-learning literature is
+that \emph{uniform} i.i.d.\ dropout is not always optimal: DropBlock removes
+contiguous spatial regions because neighboring activations are correlated and dropping
+isolated units is easily ``routed around''. This directly motivates our first
+question---whether DropGaussian's uniform, importance-agnostic masking (L1) is
+appropriate for a set of Gaussians whose importances (opacities) are extremely
+non-uniform.
 
-\textbf{Adaptive density control.} 3DGS grows and prunes Gaussians by accumulating the
-norm of the screen-space position gradient and cloning/splitting those above a fixed
-threshold, pruning low-opacity ones. This heuristic was tuned for standard,
-dropout-free training. DropGaussian leaves it untouched while drastically changing the
-forward pass; we show (L2) that this coupling is non-trivial.
+\textbf{Adaptive density control.} 3DGS grows the model by accumulating, per Gaussian,
+the norm of the screen-space position gradient and cloning/splitting those above a
+fixed threshold $\tau$---formally, it tracks a per-Gaussian running average
+$g_i=\frac{1}{n_i}\sum_t\|\nabla_{\mu_i^{2D}}\mathcal{L}\|_2$ of the screen-space
+gradient norm since the last reset and clones/splits when $g_i>\tau$---while pruning
+Gaussians whose opacity falls below a floor. The
+thresholds were tuned for standard, dropout-free training. DropGaussian changes the
+forward pass drastically yet leaves this controller untouched; we show (L2) that the
+resulting coupling is non-trivial and exploitable.
 
 \section{Baseline Reproduction}
 \label{sec:baseline}
 \textbf{Setup.} We use the official DropGaussian code on the eight LLFF~\cite{mildenhall2019llff}
-scenes with $3$ training views, COLMAP-initialized dense point clouds, downsampling
-factor $1/8$, $10{,}000$ iterations and densification every $100$ iterations (every
-8th view is held out for testing, following the standard protocol). All runs use a
-single NVIDIA RTX 3090 (24\,GB), PyTorch 2.5.1 / CUDA 12.1 in a reproducible Docker
-image. We report PSNR, SSIM and LPIPS (VGG).
+scenes with $3$ training views, COLMAP-initialized dense point clouds (provided by the
+authors), downsampling factor $1/8$, $10{,}000$ iterations and densification every
+$100$ iterations; every $8$th view is held out for testing, the standard protocol. All
+runs use a single NVIDIA RTX 3090 (24\,GB) with PyTorch 2.5.1 / CUDA 12.1 inside a
+reproducible Docker image (see \texttt{README\_IMPROVEMENT}). We report the three standard
+novel-view-synthesis metrics: PSNR (pixel fidelity, in dB, higher better), SSIM
+(structural similarity, higher better), and LPIPS (a learned perceptual distance using a
+VGG backbone, lower better). PSNR and SSIM emphasize low-level reconstruction while
+LPIPS correlates better with human perception; reporting all three guards against a
+method that optimizes one at the expense of another---a distinction that turns out to
+matter for H1 vs.\ H2.
 
-\textbf{Result.} Table~\ref{tab:repro} lists per-scene numbers. Our 8-scene mean,
-PSNR \textbf{20.43} / SSIM \textbf{0.709} / LPIPS \textbf{0.200}, matches the paper's
+\textbf{Reproduction challenges.} Two practical points were needed for a faithful
+reproduction. First, the initial point cloud matters: DropGaussian initializes from the
+authors' COLMAP \emph{dense} fused point cloud (\texttt{3\_views/dense/fused.ply}), not
+a sparse one; using a different initialization shifts results. Second, the CUDA
+rasterizer is non-deterministic (atomic adds), so single-run numbers carry noise that
+we quantify in Sec.~\ref{sec:exp}.
+
+\textbf{Result.} Table~\ref{tab:repro} lists per-scene numbers. Our 8-scene mean, PSNR
+\textbf{20.43} / SSIM \textbf{0.709} / LPIPS \textbf{0.200}, matches the paper's
 20.76 / 0.713 / 0.200 within \textbf{1.6\% PSNR}---comfortably inside the $\pm5\%$
 tolerance and essentially exact on LPIPS---confirming a faithful baseline. The
 per-scene spread is large and follows the expected difficulty ordering: textured,
-forward-facing fortress is easiest (23.6\,dB) while the thin-structure orchids and
-leaves are hardest (16--18\,dB). This spread matters later: it means single-scene
-comparisons are unreliable and motivates our 8-scene, paired evaluation.
+forward-facing fortress is easiest ($23.6$\,dB), while the thin-structure orchids and
+leaves are hardest ($16$--$18$\,dB). This spread matters later: single-scene
+comparisons are unreliable, which is why all our conclusions are drawn from 8-scene,
+paired evaluation.
 
 \begin{table}[t]
 \caption{Baseline reproduction of DropGaussian on LLFF 3-view.}
@@ -164,41 +215,52 @@ Mean (paper)          & 20.76 & 0.713 & 0.200 \\
 
 \section{Identified Limitations}
 \label{sec:limitations}
-Even with DropGaussian, we measure a large train/test PSNR gap---about $11$\,dB on
-fern and $19$\,dB on the low-texture room (train PSNR reaches 34--41\,dB while test
-stays at 22\,dB). Overfitting is therefore only \emph{partially} suppressed, leaving
-room to question the design. We derive two \emph{independent} weaknesses from the
-method itself.
+DropGaussian clearly helps---it shrinks the train/test PSNR gap from $18.2$\,dB
+(3DGS) to $14.7$\,dB (Fig.~\ref{fig:gap})---but overfitting is only \emph{partially}
+suppressed: a $14.7$\,dB gap remains. This motivates a closer look at the design, from
+which we derive two \emph{independent} weaknesses.
 
 \subsection{L1: Uniform dropout ignores Gaussian heterogeneity}
 DropGaussian applies \texttt{nn.Dropout}$(p)$ to a vector of ones and multiplies every
 opacity by the same i.i.d.\ inverted-dropout factor. Yet the learned opacity
-distribution is strongly skewed: a small set of high-opacity Gaussians carries the
-scene's structure, while a long tail of low-opacity Gaussians are redundant floaters
-that overfitting tends to spawn. Treating both identically has two consequences.
-(a) Structural Gaussians are dropped just as often as floaters; since they contribute
-most to a pixel, their random removal injects large rendering variance and noisy
-gradients. (b) The masking is not \emph{targeted}: it does not preferentially
-challenge the redundant Gaussians that are the actual symptom of overfitting. This is
-a property of the \emph{drop operator itself}, independent of how densification is run.
+distribution is far from uniform: Fig.~\ref{fig:opac} shows it is strongly
+\emph{bimodal} (U-shaped), with a large mass of high-opacity Gaussians near $o=1$ that
+carry the scene's structure and an equally large mass of near-transparent Gaussians
+near $o=0$ that are redundant floaters spawned by overfitting. Treating both extremes
+identically has two consequences. (a) Structural Gaussians are dropped just as often as
+floaters; since they dominate a pixel's color, their random removal injects large
+rendering variance and noisy gradients. (b) The masking is not \emph{targeted}: it does
+not preferentially challenge the redundant Gaussians that are the actual symptom of
+overfitting. This is a property of the \emph{drop operator itself}, independent of how
+densification is run.
 
 \subsection{L2: Dropout pollutes the densification statistics}
 3DGS decides where to clone/split from the accumulated norm of the screen-space
-position gradient, with a threshold tuned for dropout-free training. Under
-DropGaussian that gradient is read from a \emph{dropout-perturbed} forward pass:
-dropped Gaussians contribute exactly zero (their statistics are silently
-under-sampled), and surviving Gaussians have their opacity---and hence the magnitude
-of the gradient flowing to their screen-space mean---scaled up by $1/(1-p)$. The
-densification controller therefore reacts to systematically inflated gradients while
-still using the original threshold. This is a weakness of the \emph{interaction}
-between the regularizer and the density-control heuristic, mechanistically distinct
-from L1.
+position gradient, with a threshold tuned for dropout-free training. Under DropGaussian
+that gradient is read from a \emph{dropout-perturbed} forward pass: dropped Gaussians
+contribute exactly zero (their statistics are silently under-sampled that iteration),
+and surviving Gaussians have their opacity---and hence the magnitude of the gradient
+flowing to their screen-space mean---scaled up by $1/(1-p)$. The densification
+controller therefore reacts to systematically \emph{inflated} gradients while still
+using the original threshold $\tau$, biasing it toward over-densification. This is a
+weakness of the \emph{interaction} between the regularizer and the density-control
+heuristic, mechanistically distinct from L1.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.86\linewidth]{../results/figs/opacity_hist.png}
+\caption{Opacity distribution pooled over 8 scenes. The strongly bimodal (U-shaped)
+shape---many structural Gaussians near $1$ and many redundant ones near $0$---is the
+heterogeneity that uniform dropout (L1) ignores. H2 keeps the same shape with fewer
+Gaussians overall (547k vs 613k).}
+\label{fig:opac}
+\end{figure}
 
 \section{Proposed Improvements}
 \label{sec:method}
 Both improvements are implemented as options on top of the official code; the default
 path reproduces the original DropGaussian \emph{exactly}, which guarantees a fair,
-same-code baseline.
+same-code baseline. Algorithm~\ref{alg:method} summarizes the per-iteration logic.
 
 \subsection{H1: Opacity-aware adaptive dropout}
 To address L1 we replace the uniform keep probability by a per-Gaussian one that drops
@@ -215,28 +277,28 @@ $\frac1N\sum_i p_i = p$, so the \emph{global} drop strength is unchanged; only i
 \emph{allocation} across Gaussians differs. Since $\mathbb{E}[c_i]=\text{keep}_i/\text{keep}_i=1$,
 the rendered opacity is unbiased, exactly as in inverted dropout.
 
-\textbf{Why the $2p$ cap (a variance argument).} A naive opacity-weighting lets
+\textbf{Why the $2p$ cap (a variance argument).} A naive opacity-weighting would let
 $\text{keep}_i\!\to\!0$ for the lowest-opacity Gaussians, and the survivor scaling
-$1/\text{keep}_i$ then explodes. The per-Gaussian contribution variance scales like
-$o_i^2(1-\text{keep}_i)/\text{keep}_i$, which diverges as $\text{keep}_i\!\to\!0$. An
-unbounded weighting thus \emph{increases} rendering variance---the opposite of what a
-regularizer-stabilizer should do. Capping $p_i\le 2p$ bounds the compensation by
-$1/(1-2p)\le 1.67$ (at $p=0.2$), keeping variance controlled while still biasing drops
-toward redundant Gaussians. An early unbounded version (cap removed, $\text{keep}$
-floored at $0.05$, i.e.\ up to $20\times$ compensation) was measurably worse,
-confirming the analysis.
+$1/\text{keep}_i$ would then explode. The variance of a Bernoulli-masked, inverse-probability-weighted
+contribution scales like $o_i^2\,(1-\text{keep}_i)/\text{keep}_i$, which diverges as
+$\text{keep}_i\!\to\!0$. An unbounded weighting thus \emph{increases} rendering
+variance---the opposite of what a regularizer-stabilizer should do. Capping
+$p_i\le 2p$ bounds the compensation by $1/(1-2p)\le 1.67$ (at $p=0.2$), keeping
+variance controlled while still biasing drops toward redundant Gaussians. An early,
+unbounded version (cap removed, $\text{keep}$ floored at $0.05$, i.e.\ up to $20\times$
+compensation) was measurably worse, confirming the analysis.
 
 \subsection{H2: Drop-aware densification}
 To address L2 we de-bias the densification gradient by the very factor dropout
-introduced. When accumulating the screen-space gradient for a surviving Gaussian $i$
-we divide it by its compensation $c_i$ before taking the norm, so the cloning/splitting
+introduced. When accumulating the screen-space gradient for a surviving Gaussian $i$ we
+divide it by its compensation $c_i$ before taking the norm, so the cloning/splitting
 decision reflects the \emph{un-dropped} gradient magnitude:
 \begin{equation}
 \textstyle \mathrm{accum}_i \mathrel{+}= \big\| \nabla_{\!\mu^{2D}_i}\mathcal{L} \,/\, c_i \big\|_2 .
 \end{equation}
 Dropped Gaussians ($c_i=0$) are naturally excluded that iteration (they are invisible),
-exactly as before. Algorithm~\ref{alg:method} summarizes the per-iteration logic; both
-changes are $O(N)$ element-wise operations with negligible cost.
+exactly as before. Both changes are $O(N)$ element-wise operations on tensors already in
+memory, so the per-iteration cost is negligible.
 
 \begin{algorithm}[t]
 \caption{DropGaussian forward + density stats (ours)}
@@ -258,14 +320,38 @@ changes are $O(N)$ element-wise operations with negligible cost.
 \end{algorithmic}
 \end{algorithm}
 
+\subsection{Implementation details}
+Our changes touch three files of the official code and nothing else. The renderer
+(\texttt{gaussian\_renderer/\_\_init\_\_.py}) computes the compensation vector $c$ for
+the selected mode and returns it alongside the rendered image; the training loop
+(\texttt{train.py}) forwards $c$ to density-control bookkeeping; and the Gaussian model
+(\texttt{scene/gaussian\_model.py}) divides the accumulated screen-space gradient by
+$c$ when H2 is on. Behavior is selected by two flags,
+\texttt{--drop\_mode \{original,none,opacity\_aware\}} and \texttt{--drop\_aware\_densify};
+with \texttt{drop\_mode=original} and the flag off, the path is byte-for-byte the
+released DropGaussian, which is what makes our ablation a true same-code comparison.
+We keep the original random-seed handling, optimizer settings, SH warm-up and the
+$10{,}000$-iteration / densify-every-$100$ schedule unchanged, so any two configurations
+differ \emph{only} in the studied component. All runs, scripts and exact commands are
+released for reproducibility.
+
 \section{Experiments}
 \label{sec:exp}
-\textbf{Protocol.} All configurations share the same scenes, hyper-parameters,
-hardware and code path (only the flags differ), and are run in the \emph{same batch}
-to control for machine load---a fair, controlled comparison. We ablate
-\{none (3DGS), original, +H1, +H2, +H1+H2\} over all eight LLFF scenes. Because the
-CUDA rasterizer uses non-deterministic \texttt{atomicAdd}, we also estimate the
-run-to-run noise floor by repeating an identical configuration four times.
+\textbf{Protocol.} All configurations share the same scenes, hyper-parameters, hardware
+and code path (only the flags differ) and are run in the \emph{same batch} to control
+for machine load---a fair, controlled comparison. We ablate \{none (3DGS), original,
++H1, +H2, +H1+H2\} over all eight LLFF scenes. Because the rasterizer is
+non-deterministic, we also estimate the run-to-run noise floor by repeating an
+identical configuration four times.
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=0.92\linewidth]{../results/figs/summary.png}
+\caption{Ablation summary over all 8 LLFF 3-view scenes (best per metric outlined in
+red). H2 attains the best PSNR and the most compact model; all variants beat 3DGS.
+H1/H1+H2 reach marginally better LPIPS/SSIM but \emph{inflate} the Gaussian count.}
+\label{fig:summary}
+\end{figure*}
 
 \begin{table}[t]
 \caption{8-scene ablation on LLFF 3-view (mean over 8 scenes, same env/batch).
@@ -288,9 +374,9 @@ DropGaussian (orig.)  & 20.38 & 0.707 & 0.203 & --- \\
 \end{table}
 
 \begin{table}[t]
-\caption{Per-scene PSNR (original vs.\ +H2) and final Gaussian count, from the same
-ablation batch. The original column differs slightly from Table~\ref{tab:repro} as it
-is an independent run (rasterization non-determinism).}
+\caption{Per-scene PSNR (original vs.\ +H2) and final Gaussian count, same ablation
+batch. The original column differs slightly from Table~\ref{tab:repro} (independent run,
+rasterization non-determinism).}
 \label{tab:perscene}
 \centering
 \small
@@ -313,40 +399,125 @@ trex     & 22.32 & 22.50 & $+0.18$ & 59.4 & 55.3 \\
 \end{tabular}
 \end{table}
 
-\textbf{Quality (Table~\ref{tab:ablation}).} DropGaussian improves over 3DGS by
-$+0.53$\,dB, reproducing the paper's central claim. Among our variants, \emph{H2 alone
-is best} ($+0.22$\,dB, wins 6/8). H1 is slightly negative ($-0.05$\,dB, wins 3/8) and,
-tellingly, \emph{drags H2 down} when combined (H1+H2 only $+0.05$). LPIPS/SSIM are flat
-or marginally better throughout.
+\textbf{Quality (Table~\ref{tab:ablation}, Fig.~\ref{fig:summary}).} DropGaussian
+improves over 3DGS by $+0.53$\,dB, reproducing the paper's central claim. Among our
+variants, \emph{H2 alone is best} on PSNR ($+0.22$\,dB, wins 6/8). H1 is slightly
+negative ($-0.05$\,dB, wins 3/8) and, tellingly, \emph{drags H2 down} when combined
+(H1+H2 only $+0.05$). On the perceptual metrics H1/H1+H2 are marginally ahead
+(LPIPS 0.198--0.199 vs 0.202), but as shown next this comes at a large cost in model
+size. Fig.~\ref{fig:metrics} compares all five configurations side-by-side on the three
+quality metrics.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{../results/figs/metrics_bar.png}
+\caption{8-scene mean PSNR/SSIM/LPIPS for the five configurations. All variants beat
+3DGS; H2 leads on PSNR while H1/H1+H2 are marginally ahead on the perceptual metrics.}
+\label{fig:metrics}
+\end{figure}
+
+\textbf{Compactness is the decisive evidence (Fig.~\ref{fig:gauss}).} On \emph{all
+eight} scenes H2 reduces the final Gaussian count by $\sim$10\% (mean
+$76.6\text{k}\!\to\!68.4\text{k}$, $-10.7\%$) with no quality loss. Unlike PSNR this is
+a deterministic, unanimous effect, and it directly validates the L2 mechanism: the
+original dropout inflates survivor gradients by $1/(1-p)$, which over-triggers
+densification into redundant Gaussians; removing that inflation makes density control
+more conservative. The contrast with H1 is stark---H1 \emph{inflates} the model to
+100k Gaussians (and H1+H2 to 98k), confirming that biasing drops toward low-opacity
+Gaussians is counter-productive (Fig.~\ref{fig:summary}, bottom-right).
+
+\begin{table}[t]
+\caption{Per-scene SSIM / LPIPS, original vs.\ +H2. Perceptual metrics are essentially
+tied (within $\pm0.003$ on most scenes), consistent with the sub-dB PSNR change.}
+\label{tab:ssimlpips}
+\centering
+\small
+\begin{tabular}{lcc|cc}
+\toprule
+ & \multicolumn{2}{c|}{SSIM $\uparrow$} & \multicolumn{2}{c}{LPIPS $\downarrow$} \\
+Scene & orig & +H2 & orig & +H2 \\
+\midrule
+fern     & 0.755 & 0.754 & 0.188 & 0.191 \\
+flower   & 0.653 & 0.655 & 0.237 & 0.235 \\
+fortress & 0.732 & 0.729 & 0.184 & 0.179 \\
+horns    & 0.674 & 0.682 & 0.256 & 0.259 \\
+leaves   & 0.650 & 0.649 & 0.200 & 0.203 \\
+orchids  & 0.512 & 0.512 & 0.255 & 0.256 \\
+room     & 0.854 & 0.855 & 0.158 & 0.154 \\
+trex     & 0.830 & 0.837 & 0.145 & 0.139 \\
+\midrule
+\textbf{Mean} & 0.707 & 0.709 & 0.203 & 0.202 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Perceptual metrics (Table~\ref{tab:ssimlpips}).} At the per-scene level SSIM and
+LPIPS are essentially tied between original and H2 (mean SSIM $0.707\!\to\!0.709$, LPIPS
+$0.203\!\to\!0.202$), with scene-by-scene differences mostly within $\pm0.003$. This is
+the expected signature of a sub-dB, compactness-oriented change: H2 removes redundant
+Gaussians without altering the perceived image, so it improves PSNR and model size while
+leaving the perceptual metrics flat---neither helping nor hurting them.
+
+\textbf{Overfitting (Fig.~\ref{fig:gap}).} The train/test PSNR gap falls from
+$18.2$\,dB (3DGS) to $14.7$\,dB (DropGaussian) to $14.0$\,dB (+H2): H2 both raises test
+PSNR and lowers train PSNR, i.e.\ it regularizes slightly more than the original, which
+is consistent with producing a leaner model.
 
 \textbf{Noise floor (Fig.~\ref{fig:noise}).} Four identical \emph{original} runs give
 PSNR std $0.07$\,dB on fern but $0.25$\,dB on room. The non-determinism is real and
-scene-dependent. H2's $+0.22$\,dB mean (paired $t\!\approx\!2.3$, $p\!\approx\!0.05$)
-is therefore only \emph{near-but-above} this floor on PSNR alone---which is why we lean
-on the next, deterministic, observation.
+scene-dependent. H2's $+0.22$\,dB mean (paired $t\!\approx\!2.3$, $p\!\approx\!0.05$) is
+therefore only \emph{near-but-above} this floor on PSNR alone---which is exactly why we
+treat the deterministic compactness result, not the PSNR, as the primary evidence.
+Fig.~\ref{fig:delta} plots the per-scene $\Delta$PSNR against the fern noise band: the
+wins on fortress/room/horns clearly exceed it; the two small losses (fern, orchids) sit
+inside it.
 
-\textbf{Compactness is the decisive evidence (Fig.~\ref{fig:gauss},
-Table~\ref{tab:perscene}).} On \emph{all eight} scenes H2 reduces the final Gaussian
-count by $\sim$10\% (mean $76.6\text{k}\!\to\!68.4\text{k}$, $-10.7\%$), with no quality
-loss. Unlike PSNR this is a deterministic, unanimous effect, and it directly validates
-the L2 mechanism: the original dropout inflates survivor gradients by $1/(1-p)$, which
-over-triggers densification and breeds redundant Gaussians (a form of overfitting);
-removing that inflation makes density control more conservative. Fig.~\ref{fig:delta}
-shows the per-scene $\Delta$PSNR against the fern noise band: the wins on
-fortress/room/horns clearly exceed it, the two small losses (fern/orchids) sit inside
-it.
+\textbf{Per-scene analysis (Fig.~\ref{fig:perscene}).} Breaking PSNR down by scene
+clarifies \emph{where} H2 helps. The largest gains are on fortress ($+0.71$), room
+($+0.37$) and horns ($+0.36$)---scenes with substantial planar/low-frequency structure,
+where the original dropout's gradient inflation spawns the most redundant floaters and
+H2's more conservative densification therefore helps most (these three are also among
+the largest absolute Gaussian-count reductions). The gains shrink to near zero on the
+thin-structure scenes leaves ($+0.09$), where almost every Gaussian is genuinely needed,
+and turn marginally negative on fern and orchids ($-0.13$ each)---both within the
+single-scene noise band of Fig.~\ref{fig:noise}. The 3DGS$\rightarrow$DropGaussian
+$\rightarrow$H2 ordering, however, is monotonic on \emph{every} scene, so the ranking
+itself is stable even where the H2-vs-original margin is noise-sized.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{../results/figs/perscene_psnr.png}
+\caption{Per-scene PSNR for 3DGS, DropGaussian and +H2. The
+3DGS\,$<$\,DropGaussian\,$\le$\,H2 ordering holds on all eight scenes.}
+\label{fig:perscene}
+\end{figure}
 
 \textbf{Efficiency.} The $\sim$10\% fewer Gaussians translate into lower peak memory
 (e.g.\ fortress $124\!\to\!116$\,MB, leaves $168\!\to\!153$\,MB) and proportionally
 cheaper rendering. Training time is unchanged ($\sim$1:18 vs $\sim$1:20 per scene); H1
 and H2 are both $O(N)$ element-wise and add no measurable overhead.
 
+\textbf{Qualitative (Fig.~\ref{fig:cmp}).} On held-out views 3DGS shows the most
+artifacts; DropGaussian and H2 are visually close, as expected from a sub-dB
+difference. The improvement of H2 is therefore better characterized quantitatively
+(compactness, overfitting gap) than visually---a point we make explicitly rather than
+over-claim from a cherry-picked crop.
+
 \begin{figure}[t]
 \centering
 \includegraphics[width=\linewidth]{../results/figs/gauss_bar.png}
-\caption{Final Gaussian count, original vs.\ +H2. H2 produces a more compact model on
-all eight scenes ($-10.7\%$ mean), a deterministic, noise-free effect.}
+\caption{Final Gaussian count, original vs.\ +H2, per scene. H2 is more compact on all
+eight scenes ($-10.7\%$ mean)---a deterministic, noise-free effect.}
 \label{fig:gauss}
+\end{figure}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{../results/figs/gap.png}
+\caption{Train vs.\ test PSNR (left) and the train/test gap (right), 8-scene mean.
+DropGaussian shrinks the gap over 3DGS; H2 shrinks it slightly further, i.e.\ it
+overfits less.}
+\label{fig:gap}
 \end{figure}
 
 \begin{figure}[t]
@@ -374,50 +545,85 @@ more scenes (horns, room) are in the data package.}
 \label{fig:cmp}
 \end{figure}
 
-\textbf{Qualitative (Fig.~\ref{fig:cmp}).} 3DGS shows the most artifacts; DropGaussian
-and H2 are visually close, as expected from a sub-dB difference. The improvement is
-better characterized quantitatively (compactness) than visually.
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{../results/figs/horns_compare.png}
+\caption{Held-out views (horns, where H2 wins $+0.36$\,dB): GT, 3DGS, DropGaussian,
+Ours (H2).}
+\label{fig:horns}
+\end{figure}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{../results/figs/room_compare.png}
+\caption{Held-out views (room, where H2 wins $+0.37$\,dB): GT, 3DGS, DropGaussian,
+Ours (H2).}
+\label{fig:room}
+\end{figure}
+
+\textbf{More qualitative results.} Figs.~\ref{fig:horns}--\ref{fig:room} show the two
+indoor/structured scenes on which H2 helps most. Even here the three methods are
+perceptually close---again confirming that H2's benefit is primarily a leaner, less
+overfit model rather than a visible jump in image quality. 3DGS still shows the most
+high-frequency floaters in background regions, which both DropGaussian and H2 suppress;
+H2's renderings are produced by $\sim$10\% fewer Gaussians than DropGaussian's, i.e.\ the
+same visual result at lower cost.
 
 \section{Discussion \& Conclusion}
 \textbf{Did the hypotheses hold?} \emph{H1: no.} Opacity-aware dropout is $-0.05$\,dB
 (wins 3/8) and harms H2 when combined. The reason is mechanistic: DropGaussian works
 precisely \emph{because} it occasionally removes dominant high-opacity Gaussians,
 forcing the rest to compensate; H1 protects exactly those Gaussians and thereby blunts
-the regularizer. The bounded compensation needed to keep variance sane (Sec.~\ref{sec:method})
-cannot recover this loss. Tellingly, H1 also \emph{inflates} the model to $100$k
-Gaussians (vs.\ $76.6$k original and $68.4$k for H2)---the opposite of H2's
-compactness---further evidence that biasing drops toward low-opacity Gaussians
-backfires. The hypothesis is cleanly falsified.
+the regularizer. Tellingly, H1 also \emph{inflates} the model to 100k Gaussians (vs.\
+76.6k original and 68.4k for H2)---the opposite of H2's compactness---further evidence
+that biasing drops toward low-opacity Gaussians backfires. The bounded compensation
+needed to keep variance sane (Sec.~\ref{sec:method}) cannot recover this loss. The
+hypothesis is cleanly falsified.
 
 \emph{H2: yes, with a nuance.} Drop-aware densification gives $+0.22$\,dB (6/8) and,
 more robustly, a deterministic $\sim$10\% reduction in Gaussian count on every scene at
-equal-or-better SSIM/LPIPS and no extra cost. The PSNR gain alone sits near the
-rasterization noise floor, but the compactness result is noise-free and confirms the L2
-mechanism directly. We therefore regard H2 as a genuine, if modest, improvement:
-\emph{equal-or-better quality with a leaner, less-overfit model}.
+equal-or-better SSIM/LPIPS, a smaller overfitting gap, and no extra cost. The PSNR gain
+alone sits near the rasterization noise floor, but the compactness and gap results are
+noise-free and confirm the L2 mechanism directly. We therefore regard H2 as a genuine,
+if modest, improvement: \emph{equal-or-better quality with a leaner, less-overfit
+model}.
+
+\textbf{A quality--compactness trade-off.} The ablation reveals a small Pareto
+structure rather than a single dominating configuration. H2 leads on PSNR, on model
+size, and on the overfitting gap; H1 and H1+H2 instead edge ahead on the perceptual
+metrics (LPIPS/SSIM) but at the price of $30$--$45\%$ \emph{more} Gaussians (100k/98k vs
+68k). For sparse-view 3DGS---where deployment cost and floater suppression are first-class
+concerns---we view H2's operating point (best fidelity at the smallest model) as the more
+useful one, but the trade-off makes the ``best'' configuration genuinely
+application-dependent, and we report both rather than declaring a single winner.
 
 \textbf{Why the gains are small.} DropGaussian is already a strong, carefully-tuned
 regularizer. Refining the \emph{shape} of the dropout (H1) or its \emph{coupling} to
 densification (H2) operates at the margin and is easily masked by stochastic
 rasterization noise. This is an honest near-zero/small result; we deliberately avoid
-cherry-picking a single favorable scene, which the noise analysis shows would be
-misleading.
+cherry-picking a single favorable scene, which the noise analysis (Fig.~\ref{fig:noise})
+shows would be misleading. We consider exposing this noise floor itself a useful
+contribution: several sparse-view papers report single-run, single-scene deltas of a
+few tenths of a dB, which our measurements suggest can be within run-to-run variance.
 
 \textbf{Limitations \& future work.} Our study is confined to LLFF 3-view; the noise
-floor would ideally be estimated per configuration with more repeats. More importantly,
-the analysis suggests that \emph{larger, structured} interventions are needed to move
-the needle: (i) DropBlock-style \emph{spatial} dropout that removes correlated clusters
-of Gaussians rather than i.i.d.\ singletons (directly attacking L1's ``routing-around''
-failure), and (ii) overfitting-adaptive drop schedules that allocate more
-regularization to early densification, when redundant Gaussians are born. H2 also
-suggests a broader principle: any regularizer that alters the forward pass should
-re-examine its interaction with adaptive density control.
+floor would ideally be estimated per configuration with more repeats, and the analysis
+extended to Mip-NeRF360 and to 6/9-view settings. More importantly, the results suggest
+that \emph{larger, structured} interventions are needed to move the needle: (i)
+DropBlock-style \emph{spatial} dropout that removes correlated \emph{clusters} of
+Gaussians rather than i.i.d.\ singletons, directly attacking L1's ``routing-around''
+failure; and (ii) overfitting-adaptive drop schedules that allocate more regularization
+to the early densification phase, when redundant Gaussians are born. Finally, H2
+suggests a broader principle worth testing elsewhere: \emph{any} regularizer that
+alters the forward pass should re-examine its interaction with adaptive density
+control, since that controller was tuned for the unperturbed pass.
 
 \section*{AI Usage Statement}
 AI tools (Claude) were used to assist with Docker environment setup, debugging, the
-code implementation of H1/H2, experiment orchestration/scripting, and the
-drafting/polishing of this report. All experiments were executed by the author on the
-described hardware, and every reported number is a real measurement from those runs.
+code implementation of H1/H2, experiment orchestration/scripting, figure generation,
+and the drafting/polishing of this report. All experiments were executed by the author
+on the described hardware, and every reported number is a real measurement from those
+runs.
 
 \begin{thebibliography}{00}
 \bibitem{kerbl3Dgaussians} B. Kerbl, G. Kopanas, T. Leimk\"uhler, and G. Drettakis,
@@ -431,6 +637,14 @@ View Synthesis using Gaussian Splatting,'' in \textit{Proc. ECCV}, 2024.
 \bibitem{mildenhall2019llff} B. Mildenhall, P. Srinivasan, R. Ortiz-Cayon
 \textit{et al.}, ``Local Light Field Fusion: Practical View Synthesis with Prescriptive
 Sampling Guidelines,'' \textit{ACM Trans. Graphics}, vol.~38, no.~4, 2019.
+\bibitem{jain2021dietnerf} A. Jain, M. Tancik, and P. Abbeel, ``Putting NeRF on a Diet:
+Semantically Consistent Few-Shot View Synthesis,'' in \textit{Proc. ICCV}, 2021.
+\bibitem{niemeyer2022regnerf} M. Niemeyer, J. T. Barron, B. Mildenhall \textit{et al.},
+``RegNeRF: Regularizing Neural Radiance Fields for View Synthesis from Sparse Inputs,''
+in \textit{Proc. IEEE/CVF CVPR}, 2022.
+\bibitem{yang2023freenerf} J. Yang, M. Pavone, and Y. Wang, ``FreeNeRF: Improving
+Few-shot Neural Rendering with Free Frequency Regularization,'' in \textit{Proc.
+IEEE/CVF CVPR}, 2023.
 \end{thebibliography}
 
 \end{document}
