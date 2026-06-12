@@ -3,7 +3,7 @@
 Fork of the official **DropGaussian** (CVPR 2025) with two methodological improvements
 targeting its sparse-view overfitting behaviour. All changes live on the `improvement` branch.
 
-> See the accompanying report (`report/`) for the full motivation, analysis and experiments.
+> See the accompanying report (submitted in school homework platform) for the full motivation, analysis and experiments.
 > Section references below point to that report.
 
 ## 1. What was changed (vs. the report)
@@ -65,25 +65,32 @@ Baseline reproduction matches the paper within 1.6% PSNR (8-scene mean 20.43 vs 
 
 ## 4. Environment
 
-Reproducible Docker image (matches the paper's `environment.yaml`: PyTorch 2.5.1 / CUDA 12.1):
 
 ```bash
-# Base image (Python 3.11, torch 2.5.1+cu121, nvcc 12.1)
-docker run -d --name dropgaussian --gpus all -v $PWD:/workspace -w /workspace \
-    pytorch/pytorch:2.5.1-cuda12.1-cudnn9-devel sleep infinity
+# Create Anaconda environment(Python 3.10)
+conda create -n DropGaussian python=3.10
+conda activate DropGaussian
 
-# CUDA extensions (RTX 3090 = sm_86)
-docker exec dropgaussian bash -lc \
-  'TORCH_CUDA_ARCH_LIST=8.6 pip install ./submodules/simple-knn ./submodules/diff-gaussian-rasterization'
+# Install mpmath
+pip install mpmath==1.3.0
 
-# Python deps: plyfile matplotlib torchmetrics==1.2.0 opencv-python-headless scipy
-# LPIPS(vgg) weights must be cached at /root/.cache/torch/hub/checkpoints/
-#   vgg16-397923af.pth  (torchvision VGG16 IMAGENET1K_V1)
-#   vgg.pth             (richzhang LPIPS v0.1)
+# Install torch torchvision torchaudio
+pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130
+
+pip install tqdm
+pip install plyfile
+pip install matplotlib
+pip install torchmetrics==1.2.0
+pip install opencv_python
+pip install scipy
+
+pip install ./submodules/simple-knn --no-build-isolation
+pip install ./submodules/diff-gaussian-rasterization --no-build-isolation
+
 ```
 
-- **Hardware used**: NVIDIA RTX 3090 (24 GB), driver 535 / CUDA 12.2.
-- **Python** 3.11, **CUDA** 12.1, **PyTorch** 2.5.1.
+- **Hardware used**: NVIDIA RTX 5060 (8 GB), driver 596.49 / CUDA 13.1.
+- **Python** 3.10, **CUDA** 13.1, **PyTorch** 2.12.0.
 
 ## 5. Logs & data
 
